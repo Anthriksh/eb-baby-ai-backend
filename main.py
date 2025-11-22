@@ -152,7 +152,7 @@ def save_web_knowledge(
 
 @app.get("/")
 def read_root():
-    return {"message": "👶 Baby AI backend is running with command support!"}
+    return {"message": " Baby AI backend is running with command support!"}
 
 
 @app.get("/health")
