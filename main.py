@@ -25,51 +25,47 @@ class CommandRequest(BaseModel):
 
 # ---------------- Helper: fetch from internet ----------------
 
-async def fetch_wikipedia_summary(topic: str) -> tuple[str, bool, str | None]:
+async def fetch_summary_from_duckduckgo(topic: str) -> tuple[str, bool, str | None]:
     """
-    Try to fetch a summary for a topic from Wikipedia.
-    Returns (summary, from_internet, error_message)
+    Fetch a summary from DuckDuckGo Instant Answer API.
+    Returns (summary_text, from_internet, error_message).
     """
-    wiki_topic = topic.replace(" ", "_")
-    url = (
-        "https://en.wikipedia.org/w/api.php"
-        f"?action=query&format=json&prop=extracts&exintro&explaintext&titles={wiki_topic}"
-    )
+    url = "https://api.duckduckgo.com/"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url)
+            r = await client.get(
+                url,
+                params={
+                    "q": topic,
+                    "format": "json",
+                    "no_html": 1,
+                    "skip_disambig": 1,
+                },
+            )
 
         if r.status_code != 200:
             return (
-                f"(Fallback) Could not fetch live data for '{topic}'. HTTP {r.status_code}.",
+                f"(Fallback) HTTP {r.status_code} while fetching '{topic}'.",
                 False,
                 f"HTTP {r.status_code}",
             )
 
         data = r.json()
-        pages = data.get("query", {}).get("pages", {})
-        if not pages:
+        abstract = data.get("AbstractText", "")
+
+        if not abstract:
             return (
-                f"(Fallback) No Wikipedia page found for '{topic}'.",
+                f"(Fallback) No direct summary found for '{topic}'.",
                 False,
-                "No pages in response",
+                "Empty abstract",
             )
 
-        page = next(iter(pages.values()))
-        summary = page.get("extract") or ""
-        if not summary:
-            return (
-                f"(Fallback) Wikipedia page for '{topic}' has no extract.",
-                False,
-                "Empty extract",
-            )
-
-        return summary, True, None
+        return abstract, True, None
 
     except Exception as e:
         return (
-            f"(Fallback) Error fetching data for '{topic}': {e}",
+            f"(Fallback) Error fetching '{topic}': {e}",
             False,
             str(e),
         )
@@ -152,7 +148,7 @@ def save_web_knowledge(
 
 @app.get("/")
 def read_root():
-    return {"message": " Baby AI backend is running with command support!"}
+    return {"message": "Baby AI backend is running with command support!"}
 
 
 @app.get("/health")
@@ -211,7 +207,7 @@ async def run_command(req: CommandRequest, db: Session = Depends(get_db)):
     """
     Understand a simple natural-language command and either:
       - fetch a recipe
-      - fetch a generic topic summary
+      - fetch a generic topic summary (via DuckDuckGo)
     Then store it in WebKnowledge and return info about what happened.
     """
 
@@ -246,8 +242,9 @@ async def run_command(req: CommandRequest, db: Session = Depends(get_db)):
         content, from_internet, error_msg = await fetch_recipe(dish_or_topic)
         source = "recipe_api" if from_internet else "recipe_api_fallback"
     else:
-        content, from_internet, error_msg = await fetch_wikipedia_summary(dish_or_topic)
-        source = "wikipedia" if from_internet else "wikipedia_fallback"
+        # USE DUCKDUCKGO INSTEAD OF WIKIPEDIA
+        content, from_internet, error_msg = await fetch_summary_from_duckduckgo(dish_or_topic)
+        source = "duckduckgo" if from_internet else "duckduckgo_fallback"
 
     record = save_web_knowledge(db, dish_or_topic, content, source)
 
