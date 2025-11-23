@@ -9,7 +9,7 @@ import models
 
 # ---------------- CONFIG ----------------
 # Your personal proxy URL (LocalTunnel)
-PROXY_BASE_URL = "https://early-beans-shout.loca.lt"
+PROXY_BASE_URL = "https://empty-dragons-search.loca.lt"
 
 # Create tables
 Base.metadata.create_all(bind=engine)
