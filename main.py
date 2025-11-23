@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import httpx
+import re
 
 from database import Base, engine, get_db
 import models
@@ -13,7 +14,7 @@ PROXY_BASE_URL = "https://early-beans-shout.loca.lt"
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Web Baby AI - Backend with Commands + Personal Proxy")
+app = FastAPI(title="Web Baby AI - Backend with Commands + Personal Proxy + Multi-Source")
 
 
 # ---------------- Pydantic Models ----------------
@@ -27,11 +28,78 @@ class CommandRequest(BaseModel):
     command: str
 
 
+# ---------------- Small helper: clean HTML to text ----------------
+
+def clean_html_to_text(html: str) -> str:
+    """
+    Remove scripts/styles/tags and compress whitespace.
+    Not perfect, but good enough to turn pages into readable text.
+    """
+    # remove script and style blocks
+    text = re.sub(r"(?is)<script.*?>.*?</script>", "", html)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", "", text)
+    # remove all tags
+    text = re.sub(r"<[^>]+>", " ", text)
+    # collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    # limit length (so response isn't huge)
+    return text[:4000]
+
+
+# ---------------- Helper: DuckDuckGo Instant Answer API ----------------
+
+async def fetch_summary_from_duckduckgo(topic: str) -> tuple[str, bool, str | None]:
+    """
+    Try to get a clean summary from DuckDuckGo Instant Answer API.
+    Returns (summary_text, from_internet, error_message).
+    """
+    url = "https://api.duckduckgo.com/"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                url,
+                params={
+                    "q": topic,
+                    "format": "json",
+                    "no_html": 1,
+                    "skip_disambig": 1,
+                },
+            )
+
+        if r.status_code != 200:
+            return (
+                f"(Fallback) DuckDuckGo HTTP {r.status_code} while fetching '{topic}'.",
+                False,
+                f"HTTP {r.status_code}",
+            )
+
+        data = r.json()
+        abstract = data.get("AbstractText", "")
+
+        if not abstract:
+            return (
+                f"(Fallback) DuckDuckGo had no direct summary for '{topic}'.",
+                False,
+                "Empty abstract",
+            )
+
+        return abstract, True, None
+
+    except Exception as e:
+        return (
+            f"(Fallback) Error calling DuckDuckGo for '{topic}': {e}",
+            False,
+            str(e),
+        )
+
+
 # ---------------- Helper: fetch via YOUR proxy ----------------
 
 async def fetch_via_personal_proxy(topic: str) -> tuple[str, bool, str | None]:
     """
     Ask your local proxy (running on your laptop) to fetch content for a topic.
+    Then clean HTML into text.
     """
     if not PROXY_BASE_URL:
         return (
@@ -62,15 +130,23 @@ async def fetch_via_personal_proxy(topic: str) -> tuple[str, bool, str | None]:
                 data["error"],
             )
 
-        content = data.get("content", "")
-        if not content:
+        raw_html = data.get("content", "")
+        if not raw_html:
             return (
                 f"(Fallback) Proxy returned no content for '{topic}'.",
                 False,
                 "Empty content",
             )
 
-        return content, True, None
+        cleaned = clean_html_to_text(raw_html)
+        if not cleaned:
+            return (
+                f"(Fallback) Proxy content for '{topic}' could not be cleaned.",
+                False,
+                "Empty cleaned text",
+            )
+
+        return cleaned, True, None
 
     except Exception as e:
         return (
@@ -78,6 +154,30 @@ async def fetch_via_personal_proxy(topic: str) -> tuple[str, bool, str | None]:
             False,
             str(e),
         )
+
+
+# ---------------- Multi-source topic fetcher ----------------
+
+async def fetch_topic_knowledge(topic: str) -> tuple[str, bool, str | None, str]:
+    """
+    Try multiple sources in order:
+      1) DuckDuckGo Instant Answer API (short summary)
+      2) Personal proxy (your laptop, full web page -> cleaned)
+
+    Returns: (content, from_internet, error_message, source_name)
+    """
+    # 1) Try DuckDuckGo API
+    content, ok, err = await fetch_summary_from_duckduckgo(topic)
+    if ok:
+        return content, True, None, "duckduckgo_api"
+
+    # 2) Fallback to your proxy
+    content2, ok2, err2 = await fetch_via_personal_proxy(topic)
+    if ok2:
+        return content2, True, None, "personal_proxy"
+
+    # If both fail, return the last error
+    return content2, False, err2, "topic_fallback"
 
 
 # ---------------- Helper: recipe API ----------------
@@ -157,7 +257,7 @@ def save_web_knowledge(
 
 @app.get("/")
 def root():
-    return {"message": "Baby AI backend running with personal proxy internet access!"}
+    return {"message": "Baby AI backend running with multi-source internet access (DuckDuckGo + personal proxy)!"}
 
 
 @app.get("/health")
@@ -236,8 +336,7 @@ async def run_command(req: CommandRequest, db: Session = Depends(get_db)):
         content, ok, err = await fetch_recipe(dish_or_topic)
         source = "recipe_api" if ok else "recipe_fallback"
     else:
-        content, ok, err = await fetch_via_personal_proxy(dish_or_topic)
-        source = "personal_proxy" if ok else "proxy_fallback"
+        content, ok, err, source = await fetch_topic_knowledge(dish_or_topic)
 
     # SAVE IN DB
     record = save_web_knowledge(db, dish_or_topic, content, source)
@@ -247,6 +346,7 @@ async def run_command(req: CommandRequest, db: Session = Depends(get_db)):
         "original_command": req.command,
         "topic_or_dish": dish_or_topic,
         "from_internet": ok,
+        "source": source,
         "debug_error": err,
         "stored_summary_preview": record.summary[:350],
     }
